@@ -1,0 +1,7 @@
+Object
+Pedestrian
+Tree
+TrafficLight-Green
+TrafficLight-Red
+Turn-Right
+Turn-Left
