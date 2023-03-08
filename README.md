@@ -1,2 +1,2 @@
-# PiCardo
-Machine Learning in Science - 2 project repository
+# PiCarNet
+Private repo for Machine Learning in Science - 2 project
