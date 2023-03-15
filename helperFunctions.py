@@ -13,12 +13,11 @@ from sklearn.model_selection import train_test_split
 
 import tensorflow as tf
 from keras.preprocessing.image import ImageDataGenerator
-from keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization, Input, Activation, Flatten, Concatenate,  MaxPooling2D, UpSampling2D, Conv2D
+from keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization, Input
 from keras.models import Sequential, Model
 from keras.applications.mobilenet_v2 import MobileNetV2
-from keras.applications import EfficientNetV2B0, Xception, DenseNet201
-from keras.callbacks import EarlyStopping, ModelCheckpoint, TensorBoard
-from keras.optimizers import Adam, RMSprop, Adagrad, Adadelta
+from keras.callbacks import EarlyStopping, ModelCheckpoint, TensorBoard, History
+
 
 def load_data(data_path: str) -> pd.DataFrame:
     """Loads data from csv file
@@ -65,12 +64,13 @@ def split_data(data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 def visualize(data, attr):
     nBins = 60
     plt.hist(data.loc[:,attr], bins=nBins)
+    plt.grid(False)
     plt.gca().set(title=f'Distribution of steering {attr}', ylabel='Frequency')
 
 """## Data pipeline"""
 
 # Generate images on the fly while training model
-def img_generator(train_data: pd.DataFrame, val_data: pd.DataFrame, BATCH_SIZE: int) -> Tuple[Iterator, Iterator]:
+def img_generator(train_data: pd.DataFrame, val_data: pd.DataFrame, test_dir: os.PathLike, BATCH_SIZE: int, IMG_HEIGHT: int, IMG_WIDTH: int) -> Tuple[Iterator, Iterator, Iterator]:
     """
     Params
     ------
@@ -78,12 +78,18 @@ def img_generator(train_data: pd.DataFrame, val_data: pd.DataFrame, BATCH_SIZE: 
         Pandas dataframe containing training data
     val_data: pd.DataFrame
         Pandas dataframe containing validation data
+    test_dir: os.PathLike
+        path to test data directory
     BATCH_SIZE: int
         Number of images to process in each batch.
+    IMG_HEIGHT: int
+        image height
+    IMG_WIDTH: int
+        image width
     Returns
     -------
-    Tuple[Iterator, Iterator]
-        keras ImageDataGenerators used for training and validating model.
+    Tuple[Iterator, Iterator, Iterator]
+        keras ImageDataGenerators used for training, validation and testing the model.
     """
 
     train_generator = ImageDataGenerator(
@@ -101,13 +107,14 @@ def img_generator(train_data: pd.DataFrame, val_data: pd.DataFrame, BATCH_SIZE: 
     )
 
     val_generator = ImageDataGenerator(rescale=1.0 / 255)
+    test_generator = ImageDataGenerator(rescale=1.0 / 255)
 
     train_generator = train_generator.flow_from_dataframe(dataframe=train_data,
                                                           directory=None,
                                                           x_col='image_id',
                                                           y_col=['angle','speed'],
                                                           color_mode='rgb',
-                                                          target_size=(224, 224),
+                                                          target_size=(IMG_HEIGHT, IMG_WIDTH),
                                                           class_mode='raw',
                                                           batch_size=BATCH_SIZE,
                                                           shuffle=True)
@@ -116,14 +123,24 @@ def img_generator(train_data: pd.DataFrame, val_data: pd.DataFrame, BATCH_SIZE: 
                                                       x_col='image_id',
                                                       y_col=['angle', 'speed'],
                                                       color_mode='rgb',
-                                                      target_size=(224, 224),
+                                                      target_size=(IMG_HEIGHT, IMG_WIDTH),
                                                       class_mode='raw',
                                                       batch_size=BATCH_SIZE,
                                                       shuffle=True)
 
+    test_generator = test_generator.flow_from_directory(
+        directory=test_dir,
+        target_size=(IMG_HEIGHT, IMG_WIDTH),
+        color_mode='rgb',
+        class_mode=None,
+        classes=None,
+        batch_size=BATCH_SIZE,
+        seed=1234,
+        shuffle=False)
 
 
-    return train_generator, val_generator
+
+    return train_generator, val_generator, test_generator
 
 # create base model using transfer learning
 def create_baseline_model(input_shape, dropout_rate, optimizer) -> Sequential:
@@ -140,9 +157,6 @@ def create_baseline_model(input_shape, dropout_rate, optimizer) -> Sequential:
     Sequential
         The keras model.
     """
-    inputs = Input(
-        shape=input_shape
-    )
     mobilenet = MobileNetV2(include_top=False, weights='imagenet', input_shape=input_shape)
     mobilenet.trainable = False # Freeze the model
 
@@ -199,7 +213,7 @@ def get_callbacks(model: str) -> List[Union[TensorBoard, EarlyStopping, ModelChe
 
     early_stopping_callback = EarlyStopping(
         monitor='loss',
-        min_delta=0.01,  # model should improve by at least 0.1
+        min_delta=0.1,  # model should improve by at least 0.1
         patience=10,  # amount of epochs  with improvements worse than 1% until the model stops
         verbose=1,
         mode='min',
@@ -216,12 +230,87 @@ def get_callbacks(model: str) -> List[Union[TensorBoard, EarlyStopping, ModelChe
     )
     return [model_checkpoint_callback, tensorboard_callback, early_stopping_callback]
 
-def get_predictions(test_path: str, model: Sequential) -> pd.DataFrame:
+## Training model
+def train(name: str, model: Model, train_generator: Iterator, val_generator: Iterator, epoch: int, BATCH_SIZE: int) -> History:
     """
     Params
     ------
-    test: str
+    name: str
+        Model name
+    model: Model
+        Model we are training
+    train_generator: Iterator
+        Image data generator for training
+    val_generator: Iterator
+        Image data generator for validation
+    epoch: int
+        Number of epochs to train for
+    BATCH_SIZE: int
+        Number of images to process in each bacth
+    Returns
+    -------
+    keras.callbacks.History
+    """
+    callbacks = get_callbacks(name)
+
+    history = model.fit(train_generator,
+              epochs=epoch,
+              steps_per_epoch=300,
+              validation_data=val_generator,
+              validation_steps=100,
+              callbacks=callbacks,
+              workers=4,
+              verbose=1,
+              batch_size=BATCH_SIZE)
+
+    return history
+
+# Plotting training and validation loss from History callback
+def plot_history(history):
+    """Plots training and validation loss over epochs
+    Params
+    ------
+    history: History
+        keras History callback
+    Returns
+    -------
+    None
+    """
+    loss_list = [s for s in history.history.keys() if 'loss' in s and 'val' not in s]
+    val_loss_list = [s for s in history.history.keys() if 'loss' in s and 'val' in s]
+
+    if len(loss_list) == 0:
+        print('Loss is missing in history')
+        return
+
+    # As loss always exists
+    epochs = range(1, len(history.history[loss_list[0]]) + 1)
+
+    # Loss
+    plt.figure(1)
+    for l in loss_list:
+        plt.plot(epochs, history.history[l], 'lightblue',
+                 label='Training loss (' + str(str(format(history.history[l][-1], '.3f')) + ')'))
+    for l in val_loss_list:
+        plt.plot(epochs, history.history[l], 'coral',
+                 label='Validation loss (' + str(str(format(history.history[l][-1], '.3f')) + ')'))
+
+    plt.title('Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.grid(False)
+    plt.legend()
+    plt.savefig('tuned_baseline_plot.pdf')
+    plt.show()
+
+def get_predictions(test_path: os.PathLike, test_generator: Iterator, model: Sequential) -> pd.DataFrame:
+    """
+    Params
+    ------
+    test: os.PathLike
         path to test data
+    test_generator: Iterator
+        Data generator for testing
     model: Sequential model
         trained model to make
 
@@ -238,17 +327,17 @@ def get_predictions(test_path: str, model: Sequential) -> pd.DataFrame:
     png_df = pd.DataFrame(data=png_files, columns=['image_id'])
     png_df['image_id'] = png_df.image_id.apply(lambda x: os.path.split(x)[-1].split('.png')[0])
 
-    # prepare test tensorflow dataset for making predictions
+    """# prepare test tensorflow dataset for making predictions
     test_ds = tf.data.Dataset.from_tensor_slices(png_files).map(
         lambda image: (tf.image.decode_png(tf.io.read_file(image), channels=3))
     ).map(
         lambda image: (tf.image.convert_image_dtype(image, dtype=tf.float32))
     ).map(
         lambda image: (tf.image.resize(image, [224, 224]))
-    ).batch(32)
+    ).batch(32)"""
 
     # make predictions
-    pred = model.predict(test_ds)
+    pred = model.predict(test_generator)
 
     # convert prediction numpy.ndarray( to pd.DataFrame
     pred_df = pd.concat([png_df, pd.DataFrame(data=pred, columns=['angle', 'speed'])], axis=1)
