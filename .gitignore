@@ -6,3 +6,11 @@
 .DS_Store?
 
 .idea/
+
+# keras model files #
+# #################
+data/
+
+# tensorflow scalar logs #
+# ######################
+logs/
