@@ -6,3 +6,8 @@
 .DS_Store?
 
 .idea/
+
+# ignore keras data files and logs #
+# ################################
+data/
+logs/
